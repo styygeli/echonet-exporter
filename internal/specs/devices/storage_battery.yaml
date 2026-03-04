@@ -2,6 +2,7 @@
 # Ref: EP_CUBE_ECHONET_SPEC.md
 eoj: [0x02, 0x7D, 0x01]
 description: "EP Cube / storage battery"
+default_scrape_interval: 1m
 
 metrics:
   - epc: 0xE4
@@ -41,12 +42,14 @@ metrics:
     size: 4
     scale: 1
     type: counter
+    scrape_interval: 5m
   - epc: 0xA9
     name: cumulative_discharge_wh
     help: "Cumulative AC discharge amount in Wh."
     size: 4
     scale: 1
     type: counter
+    scrape_interval: 5m
   - epc: 0xCF
     name: working_operation_state
     help: "Working operation: 0x42=Charging, 0x43=Discharging, 0x44=Standby."

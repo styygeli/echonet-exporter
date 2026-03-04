@@ -6,9 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+const defaultScrapeInterval = time.Minute
 
 //go:embed devices/*.yaml
 var builtinDevices embed.FS
@@ -80,20 +83,22 @@ func loadFromDir(dir string) (map[string]*DeviceSpec, error) {
 }
 
 type deviceYAML struct {
-	EOJ         []int         `yaml:"eoj"`
-	Description string        `yaml:"description"`
-	Metrics     []metricYAML  `yaml:"metrics"`
+	EOJ                   []int        `yaml:"eoj"`
+	Description           string       `yaml:"description"`
+	DefaultScrapeInterval string       `yaml:"default_scrape_interval"`
+	Metrics               []metricYAML `yaml:"metrics"`
 }
 
 type metricYAML struct {
-	EPC    int     `yaml:"epc"`
-	Name   string  `yaml:"name"`
-	Help   string  `yaml:"help"`
-	Size   int     `yaml:"size"`
-	Scale  float64 `yaml:"scale"`
-	Signed bool    `yaml:"signed"`
-	Invalid *int   `yaml:"invalid"`
-	Type   string  `yaml:"type"`
+	EPC             int     `yaml:"epc"`
+	Name            string  `yaml:"name"`
+	Help            string  `yaml:"help"`
+	Size            int     `yaml:"size"`
+	Scale           float64 `yaml:"scale"`
+	Signed          bool    `yaml:"signed"`
+	Invalid         *int    `yaml:"invalid"`
+	Type            string  `yaml:"type"`
+	ScrapeInterval  string  `yaml:"scrape_interval"`
 }
 
 func parseDeviceYAML(data []byte) (*DeviceSpec, error) {
@@ -104,9 +109,22 @@ func parseDeviceYAML(data []byte) (*DeviceSpec, error) {
 	if len(raw.EOJ) != 3 {
 		return nil, fmt.Errorf("eoj must have exactly 3 bytes, got %d", len(raw.EOJ))
 	}
+	devInterval := defaultScrapeInterval
+	if raw.DefaultScrapeInterval != "" {
+		d, err := time.ParseDuration(raw.DefaultScrapeInterval)
+		if err != nil {
+			return nil, fmt.Errorf("default_scrape_interval %q: %w", raw.DefaultScrapeInterval, err)
+		}
+		if d <= 0 {
+			return nil, fmt.Errorf("default_scrape_interval must be positive, got %v", d)
+		}
+		devInterval = d
+	}
+
 	spec := &DeviceSpec{
-		Description: raw.Description,
-		Metrics:     make([]MetricSpec, 0, len(raw.Metrics)),
+		Description:           raw.Description,
+		DefaultScrapeInterval: devInterval,
+		Metrics:               make([]MetricSpec, 0, len(raw.Metrics)),
 	}
 	spec.EOJ[0] = byte(raw.EOJ[0] & 0xFF)
 	spec.EOJ[1] = byte(raw.EOJ[1] & 0xFF)
@@ -119,15 +137,27 @@ func parseDeviceYAML(data []byte) (*DeviceSpec, error) {
 		if m.Type != "gauge" && m.Type != "counter" {
 			return nil, fmt.Errorf("metric %s: type must be gauge or counter", m.Name)
 		}
+		interval := devInterval
+		if m.ScrapeInterval != "" {
+			d, err := time.ParseDuration(m.ScrapeInterval)
+			if err != nil {
+				return nil, fmt.Errorf("metric %s scrape_interval %q: %w", m.Name, m.ScrapeInterval, err)
+			}
+			if d <= 0 {
+				return nil, fmt.Errorf("metric %s scrape_interval must be positive", m.Name)
+			}
+			interval = d
+		}
 		ms := MetricSpec{
-			EPC:    byte(m.EPC & 0xFF),
-			Name:   m.Name,
-			Help:   m.Help,
-			Size:   m.Size,
-			Scale:  m.Scale,
-			Signed: m.Signed,
-			Invalid: m.Invalid,
-			Type:   m.Type,
+			EPC:              byte(m.EPC & 0xFF),
+			Name:             m.Name,
+			Help:             m.Help,
+			Size:             m.Size,
+			Scale:            m.Scale,
+			Signed:           m.Signed,
+			Invalid:         m.Invalid,
+			Type:             m.Type,
+			ScrapeInterval:   interval,
 		}
 		if ms.Scale == 0 {
 			ms.Scale = 1

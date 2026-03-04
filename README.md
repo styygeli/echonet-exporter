@@ -102,11 +102,22 @@ Device classes (metrics, EPCs, units) are defined in YAML files under `internal/
 
 **Adding a new device:** Add a YAML file in `internal/specs/devices/` and configure devices with that class. No code changes needed.
 
+### Detached scraping
+
+The exporter uses *detached scraping*: background goroutines poll devices at configurable intervals, and `/metrics` serves cached values. This avoids overloading low-CPU devices (e.g. ESP32-based EP Cube) when Prometheus scrapes frequently.
+
+- **default_scrape_interval** (device-level): Default for all metrics, e.g. `1m`. Optional; defaults to 1 minute.
+- **scrape_interval** (per-metric): Override for individual EPCs. Use longer intervals (e.g. `5m`, `10m`) for slow-changing or CPU-heavy properties.
+- **scrape_interval** (per-device, in `ECHONET_DEVICES`): Runtime override for a specific device instance, e.g. `{"name":"epcube","ip":"192.168.1.10","class":"storage_battery","scrape_interval":"2m"}`.
+
+Metrics with the same interval are batched into one ECHONET Get request per tick.
+
 **Example** (`internal/specs/devices/heat_pump.yaml`):
 
 ```yaml
 eoj: [0x01, 0x35, 0x01]
 description: "Heat pump water heater"
+default_scrape_interval: 1m
 
 metrics:
   - epc: 0x80
@@ -126,7 +137,8 @@ metrics:
 
 **Fields:**
 - `eoj` – ECHONET Object (3 bytes: group, class, instance).
-- `metrics` – list of EPCs to poll. Each: `epc` (hex), `name`, `help`, `size` (1/2/4 bytes), `scale` (multiplier), `type` (gauge/counter), optional `signed`, optional `invalid` (raw value meaning invalid).
+- `default_scrape_interval` – optional, e.g. `1m`, `30s`. Default for metrics without `scrape_interval`.
+- `metrics` – list of EPCs to poll. Each: `epc` (hex), `name`, `help`, `size` (1/2/4 bytes), `scale` (multiplier), `type` (gauge/counter), optional `signed`, optional `invalid` (raw value meaning invalid), optional `scrape_interval` (e.g. `5m` for less frequent polling).
 
 **Custom devices dir:** Set `ECHONET_DEVICES_DIR` to load additional YAML files from a directory (e.g. for local-only device specs without modifying the repo).
 

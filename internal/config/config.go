@@ -9,17 +9,18 @@ import (
 
 // Config holds exporter configuration from environment.
 type Config struct {
-	ListenAddr        string
-	ScrapeTimeoutSec  int
-	Devices           []Device
+	ListenAddr       string
+	ScrapeTimeoutSec int
+	Devices          []Device
 }
 
 // Device is a single ECHONET device to scrape.
 type Device struct {
-	Name   string            `json:"name"`
-	IP     string            `json:"ip"`
-	Class  string            `json:"class"`
-	Labels map[string]string `json:"labels,omitempty"`
+	Name           string            `json:"name"`
+	IP             string            `json:"ip"`
+	Class          string            `json:"class"`
+	Labels         map[string]string  `json:"labels,omitempty"`
+	ScrapeInterval string            `json:"scrape_interval,omitempty"` // optional override, e.g. "5m"
 }
 
 // Load reads configuration from environment (and .env already loaded by main).

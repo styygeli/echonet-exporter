@@ -2,8 +2,12 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/joho/godotenv"
 	"github.com/prometheus/client_golang/prometheus"
@@ -11,6 +15,7 @@ import (
 
 	"github.com/sty/echonet-exporter/internal/config"
 	"github.com/sty/echonet-exporter/internal/metrics"
+	"github.com/sty/echonet-exporter/internal/scraper"
 	"github.com/sty/echonet-exporter/internal/specs"
 )
 
@@ -29,7 +34,12 @@ func main() {
 		log.Fatalf("Load device specs: %v", err)
 	}
 
-	collector := metrics.NewCollector(cfg, deviceSpecs)
+	cache := scraper.NewCache()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cache.Start(ctx, cfg, deviceSpecs)
+
+	collector := metrics.NewCollector(cfg, cache, deviceSpecs)
 	prometheus.MustRegister(collector)
 
 	http.Handle("/metrics", promhttp.Handler())
@@ -39,8 +49,19 @@ func main() {
 <body><h1>ECHONET Lite Exporter</h1><p><a href="/metrics">Metrics</a></p></body></html>`))
 	})
 
+	server := &http.Server{Addr: cfg.ListenAddr}
+
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		log.Println("Shutting down...")
+		cancel()
+		server.Shutdown(context.Background())
+	}()
+
 	log.Printf("Listening on %s", cfg.ListenAddr)
-	if err := http.ListenAndServe(cfg.ListenAddr, nil); err != nil {
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("HTTP server: %v", err)
 	}
 }

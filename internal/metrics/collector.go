@@ -1,22 +1,20 @@
 package metrics
 
 import (
-	"log"
 	"sync"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sty/echonet-exporter/internal/config"
-	"github.com/sty/echonet-exporter/internal/echonet"
+	"github.com/sty/echonet-exporter/internal/scraper"
 	"github.com/sty/echonet-exporter/internal/specs"
 )
 
 const namespace = "echonet"
 
-// Collector implements prometheus.Collector and polls ECHONET devices on each scrape.
+// Collector implements prometheus.Collector and serves cached metrics from detached scrapers.
 type Collector struct {
 	cfg    *config.Config
-	client *echonet.Client
+	cache  *scraper.Cache
 	specs  map[string]*specs.DeviceSpec
 	mutex  sync.Mutex
 
@@ -26,12 +24,12 @@ type Collector struct {
 	metricDescs         map[string]map[string]*prometheus.Desc // class -> metric name -> desc
 }
 
-// NewCollector returns a new collector.
-func NewCollector(cfg *config.Config, deviceSpecs map[string]*specs.DeviceSpec) *Collector {
+// NewCollector returns a new collector that reads from the given cache.
+func NewCollector(cfg *config.Config, cache *scraper.Cache, deviceSpecs map[string]*specs.DeviceSpec) *Collector {
 	c := &Collector{
-		cfg:    cfg,
-		client: echonet.NewClient(cfg.ScrapeTimeoutSec, deviceSpecs),
-		specs:  deviceSpecs,
+		cfg:   cfg,
+		cache: cache,
+		specs: deviceSpecs,
 		scrapeSuccess: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "", "scrape_success"),
 			"1 if the last scrape of this device succeeded, 0 otherwise.",
@@ -92,28 +90,27 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	}
 }
 
-// Collect implements prometheus.Collector.
+// Collect implements prometheus.Collector. Reads from the detached scraper cache.
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
 	for _, dev := range c.cfg.Devices {
-		result, err := c.client.ScrapeDevice(dev)
-		success := 0.0
-		if err == nil && result.Success {
-			success = 1
-		} else if err != nil {
-			log.Printf("scrape %s (%s): %v", dev.Name, dev.IP, err)
+		success, durationSec, lastScrape, metrics := c.cache.Get(dev)
+
+		successVal := 0.0
+		if success {
+			successVal = 1
 		}
 
-		ch <- prometheus.MustNewConstMetric(c.scrapeSuccess, prometheus.GaugeValue, success, dev.Name, dev.IP, dev.Class)
-		ch <- prometheus.MustNewConstMetric(c.scrapeDuration, prometheus.GaugeValue, result.DurationSec, dev.Name, dev.IP, dev.Class)
+		ch <- prometheus.MustNewConstMetric(c.scrapeSuccess, prometheus.GaugeValue, successVal, dev.Name, dev.IP, dev.Class)
+		ch <- prometheus.MustNewConstMetric(c.scrapeDuration, prometheus.GaugeValue, durationSec, dev.Name, dev.IP, dev.Class)
 
-		if result.Success {
-			ch <- prometheus.MustNewConstMetric(c.lastScrapeTimestamp, prometheus.GaugeValue, float64(time.Now().Unix()), dev.Name, dev.IP, dev.Class)
+		if success && !lastScrape.IsZero() {
+			ch <- prometheus.MustNewConstMetric(c.lastScrapeTimestamp, prometheus.GaugeValue, float64(lastScrape.Unix()), dev.Name, dev.IP, dev.Class)
 		}
 
-		for name, mv := range result.Metrics {
+		for name, mv := range metrics {
 			desc, ok := c.metricDescs[dev.Class][name]
 			if !ok {
 				continue

@@ -1,6 +1,7 @@
 # Home Air Conditioner (Daikin, Mitsubishi, etc.) - ECHONET Object 0x013001
 eoj: [0x01, 0x30, 0x01]
 description: "Home air conditioner"
+default_scrape_interval: 1m
 
 metrics:
   - epc: 0x80

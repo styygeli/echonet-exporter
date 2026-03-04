@@ -2,6 +2,7 @@
 # Ref: EP_CUBE_ECHONET_SPEC.md
 eoj: [0x02, 0x79, 0x01]
 description: "Home solar power generation"
+default_scrape_interval: 1m
 
 metrics:
   - epc: 0xE0

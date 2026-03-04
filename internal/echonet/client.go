@@ -6,7 +6,6 @@ import (
 	"net"
 	"time"
 
-	"github.com/sty/echonet-exporter/internal/config"
 	"github.com/sty/echonet-exporter/internal/model"
 	"github.com/sty/echonet-exporter/internal/specs"
 )
@@ -26,14 +25,12 @@ const (
 // Client sends ECHONET Lite Get requests over UDP and parses Get_Res.
 type Client struct {
 	timeout time.Duration
-	specs   map[string]*specs.DeviceSpec
 }
 
-// NewClient creates a client with the given scrape timeout and device specs.
-func NewClient(timeoutSec int, deviceSpecs map[string]*specs.DeviceSpec) *Client {
+// NewClient creates a client with the given scrape timeout.
+func NewClient(timeoutSec int) *Client {
 	return &Client{
 		timeout: time.Duration(timeoutSec) * time.Second,
-		specs:   deviceSpecs,
 	}
 }
 
@@ -81,11 +78,16 @@ func (c *Client) SendGet(addr string, eoj [3]byte, epcs []byte) ([]byte, error) 
 	}
 
 	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
-	if err != nil {
-		return nil, err
+	for {
+		n, err := conn.Read(buf)
+		if err != nil {
+			return nil, err
+		}
+		if n >= minResponseLen && binary.BigEndian.Uint16(buf[2:4]) == tid {
+			return buf[:n], nil
+		}
+		// Ignore packets with wrong TID or too short
 	}
-	return buf[:n], nil
 }
 
 // ParseGetRes parses an ECHONET Lite frame and returns properties if it is a Get_Res.
@@ -172,34 +174,10 @@ func parseEDT(edt []byte, m specs.MetricSpec) (float64, bool) {
 	return float64(raw) * m.Scale, true
 }
 
-// ScrapeDevice runs a Get for the device and returns parsed metrics from the spec.
-func (c *Client) ScrapeDevice(dev config.Device) (DeviceResult, error) {
-	start := time.Now()
-	spec, ok := c.specs[dev.Class]
-	if !ok || spec == nil {
-		return DeviceResult{Success: false, DurationSec: time.Since(start).Seconds()}, fmt.Errorf("unknown class: %s", dev.Class)
-	}
-
-	epcs := make([]byte, 0, len(spec.Metrics))
-	for _, m := range spec.Metrics {
-		epcs = append(epcs, m.EPC)
-	}
-
-	raw, err := c.SendGet(dev.IP, spec.EOJ, epcs)
-	var out DeviceResult
-	out.DurationSec = time.Since(start).Seconds()
-	out.Metrics = make(map[string]MetricValue)
-	if err != nil {
-		return out, err
-	}
-
-	_, props, err := ParseGetRes(raw)
-	if err != nil {
-		return out, err
-	}
-	out.Success = true
-
-	for _, m := range spec.Metrics {
+// ParsePropsToMetrics converts Get_Res properties into metrics using the given metric specs.
+func ParsePropsToMetrics(props []model.GetResProperty, metrics []specs.MetricSpec) map[string]MetricValue {
+	out := make(map[string]MetricValue)
+	for _, m := range metrics {
 		edt, ok := prop(props, m.EPC)
 		if !ok {
 			continue
@@ -208,8 +186,7 @@ func (c *Client) ScrapeDevice(dev config.Device) (DeviceResult, error) {
 		if !ok {
 			continue
 		}
-		out.Metrics[m.Name] = MetricValue{Value: v, Type: m.Type}
+		out[m.Name] = MetricValue{Value: v, Type: m.Type}
 	}
-
-	return out, nil
+	return out
 }
