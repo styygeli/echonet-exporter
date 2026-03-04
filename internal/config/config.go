@@ -19,7 +19,7 @@ type Device struct {
 	Name           string            `json:"name"`
 	IP             string            `json:"ip"`
 	Class          string            `json:"class"`
-	Labels         map[string]string  `json:"labels,omitempty"`
+	Labels         map[string]string `json:"labels,omitempty"`
 	ScrapeInterval string            `json:"scrape_interval,omitempty"` // optional override, e.g. "5m"
 }
 

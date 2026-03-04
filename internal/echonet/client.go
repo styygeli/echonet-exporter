@@ -121,13 +121,6 @@ func ParseGetRes(data []byte) (tid uint16, props []model.GetResProperty, err err
 	return tid, props, nil
 }
 
-// DeviceResult holds parsed metrics for one device scrape (metric name -> value).
-type DeviceResult struct {
-	Success     bool
-	DurationSec float64
-	Metrics     map[string]MetricValue
-}
-
 // MetricValue holds a parsed value and its type (gauge or counter).
 type MetricValue struct {
 	Value float64

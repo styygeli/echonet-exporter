@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"sort"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -13,10 +14,10 @@ const namespace = "echonet"
 
 // Collector implements prometheus.Collector and serves cached metrics from detached scrapers.
 type Collector struct {
-	cfg    *config.Config
-	cache  *scraper.Cache
-	specs  map[string]*specs.DeviceSpec
-	mutex  sync.Mutex
+	cfg            *config.Config
+	cache          *scraper.Cache
+	mutex          sync.Mutex
+	extraLabelKeys []string
 
 	scrapeSuccess       *prometheus.Desc
 	scrapeDuration      *prometheus.Desc
@@ -26,32 +27,35 @@ type Collector struct {
 
 // NewCollector returns a new collector that reads from the given cache.
 func NewCollector(cfg *config.Config, cache *scraper.Cache, deviceSpecs map[string]*specs.DeviceSpec) *Collector {
+	extraLabelKeys := collectExtraLabelKeys(cfg.Devices)
+	allLabelNames := append([]string{"device", "ip", "class"}, extraLabelKeys...)
+
 	c := &Collector{
-		cfg:   cfg,
-		cache: cache,
-		specs: deviceSpecs,
+		cfg:            cfg,
+		cache:          cache,
+		extraLabelKeys: extraLabelKeys,
 		scrapeSuccess: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "", "scrape_success"),
 			"1 if the last scrape of this device succeeded, 0 otherwise.",
-			[]string{"device", "ip", "class"},
+			allLabelNames,
 			nil,
 		),
 		scrapeDuration: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "", "scrape_duration_seconds"),
 			"Duration of the last scrape for this device in seconds.",
-			[]string{"device", "ip", "class"},
+			allLabelNames,
 			nil,
 		),
 		lastScrapeTimestamp: prometheus.NewDesc(
 			prometheus.BuildFQName(namespace, "", "last_scrape_timestamp_seconds"),
 			"Unix timestamp of the last successful scrape for this device.",
-			[]string{"device", "ip", "class"},
+			allLabelNames,
 			nil,
 		),
 		metricDescs: make(map[string]map[string]*prometheus.Desc),
 	}
 
-	// Build metric descriptors from specs
+	// Build metric descriptors from specs.
 	for class, spec := range deviceSpecs {
 		if spec == nil {
 			continue
@@ -69,13 +73,40 @@ func NewCollector(cfg *config.Config, cache *scraper.Cache, deviceSpecs map[stri
 			c.metricDescs[class][m.Name] = prometheus.NewDesc(
 				prometheus.BuildFQName(namespace, subsystem, m.Name),
 				m.Help,
-				[]string{"device", "ip", "class"},
+				allLabelNames,
 				nil,
 			)
 		}
 	}
 
 	return c
+}
+
+func collectExtraLabelKeys(devices []config.Device) []string {
+	set := make(map[string]struct{})
+	for _, dev := range devices {
+		for k := range dev.Labels {
+			if k == "" {
+				continue
+			}
+			set[k] = struct{}{}
+		}
+	}
+	keys := make([]string, 0, len(set))
+	for k := range set {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func (c *Collector) labelValues(dev config.Device) []string {
+	values := make([]string, 0, 3+len(c.extraLabelKeys))
+	values = append(values, dev.Name, dev.IP, dev.Class)
+	for _, k := range c.extraLabelKeys {
+		values = append(values, dev.Labels[k])
+	}
+	return values
 }
 
 // Describe implements prometheus.Collector.
@@ -97,17 +128,18 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	for _, dev := range c.cfg.Devices {
 		success, durationSec, lastScrape, metrics := c.cache.Get(dev)
+		labels := c.labelValues(dev)
 
 		successVal := 0.0
 		if success {
 			successVal = 1
 		}
 
-		ch <- prometheus.MustNewConstMetric(c.scrapeSuccess, prometheus.GaugeValue, successVal, dev.Name, dev.IP, dev.Class)
-		ch <- prometheus.MustNewConstMetric(c.scrapeDuration, prometheus.GaugeValue, durationSec, dev.Name, dev.IP, dev.Class)
+		ch <- prometheus.MustNewConstMetric(c.scrapeSuccess, prometheus.GaugeValue, successVal, labels...)
+		ch <- prometheus.MustNewConstMetric(c.scrapeDuration, prometheus.GaugeValue, durationSec, labels...)
 
 		if success && !lastScrape.IsZero() {
-			ch <- prometheus.MustNewConstMetric(c.lastScrapeTimestamp, prometheus.GaugeValue, float64(lastScrape.Unix()), dev.Name, dev.IP, dev.Class)
+			ch <- prometheus.MustNewConstMetric(c.lastScrapeTimestamp, prometheus.GaugeValue, float64(lastScrape.Unix()), labels...)
 		}
 
 		for name, mv := range metrics {
@@ -119,7 +151,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 			if mv.Type == "counter" {
 				vt = prometheus.CounterValue
 			}
-			ch <- prometheus.MustNewConstMetric(desc, vt, mv.Value, dev.Name, dev.IP, dev.Class)
+			ch <- prometheus.MustNewConstMetric(desc, vt, mv.Value, labels...)
 		}
 	}
 }

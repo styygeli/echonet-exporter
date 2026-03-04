@@ -90,15 +90,15 @@ type deviceYAML struct {
 }
 
 type metricYAML struct {
-	EPC             int     `yaml:"epc"`
-	Name            string  `yaml:"name"`
-	Help            string  `yaml:"help"`
-	Size            int     `yaml:"size"`
-	Scale           float64 `yaml:"scale"`
-	Signed          bool    `yaml:"signed"`
-	Invalid         *int    `yaml:"invalid"`
-	Type            string  `yaml:"type"`
-	ScrapeInterval  string  `yaml:"scrape_interval"`
+	EPC            int     `yaml:"epc"`
+	Name           string  `yaml:"name"`
+	Help           string  `yaml:"help"`
+	Size           int     `yaml:"size"`
+	Scale          float64 `yaml:"scale"`
+	Signed         bool    `yaml:"signed"`
+	Invalid        *int    `yaml:"invalid"`
+	Type           string  `yaml:"type"`
+	ScrapeInterval string  `yaml:"scrape_interval"`
 }
 
 func parseDeviceYAML(data []byte) (*DeviceSpec, error) {
@@ -126,9 +126,12 @@ func parseDeviceYAML(data []byte) (*DeviceSpec, error) {
 		DefaultScrapeInterval: devInterval,
 		Metrics:               make([]MetricSpec, 0, len(raw.Metrics)),
 	}
-	spec.EOJ[0] = byte(raw.EOJ[0] & 0xFF)
-	spec.EOJ[1] = byte(raw.EOJ[1] & 0xFF)
-	spec.EOJ[2] = byte(raw.EOJ[2] & 0xFF)
+	for i, v := range raw.EOJ {
+		if v < 0 || v > 0xFF {
+			return nil, fmt.Errorf("eoj[%d] must be in range 0..255, got %d", i, v)
+		}
+		spec.EOJ[i] = byte(v)
+	}
 
 	for _, m := range raw.Metrics {
 		if m.Size != 1 && m.Size != 2 && m.Size != 4 {
@@ -136,6 +139,9 @@ func parseDeviceYAML(data []byte) (*DeviceSpec, error) {
 		}
 		if m.Type != "gauge" && m.Type != "counter" {
 			return nil, fmt.Errorf("metric %s: type must be gauge or counter", m.Name)
+		}
+		if m.EPC < 0 || m.EPC > 0xFF {
+			return nil, fmt.Errorf("metric %s: epc must be in range 0..255, got %d", m.Name, m.EPC)
 		}
 		interval := devInterval
 		if m.ScrapeInterval != "" {
@@ -149,15 +155,15 @@ func parseDeviceYAML(data []byte) (*DeviceSpec, error) {
 			interval = d
 		}
 		ms := MetricSpec{
-			EPC:              byte(m.EPC & 0xFF),
-			Name:             m.Name,
-			Help:             m.Help,
-			Size:             m.Size,
-			Scale:            m.Scale,
-			Signed:           m.Signed,
-			Invalid:         m.Invalid,
-			Type:             m.Type,
-			ScrapeInterval:   interval,
+			EPC:            byte(m.EPC),
+			Name:           m.Name,
+			Help:           m.Help,
+			Size:           m.Size,
+			Scale:          m.Scale,
+			Signed:         m.Signed,
+			Invalid:        m.Invalid,
+			Type:           m.Type,
+			ScrapeInterval: interval,
 		}
 		if ms.Scale == 0 {
 			ms.Scale = 1

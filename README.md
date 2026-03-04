@@ -23,13 +23,15 @@ Each device in `ECHONET_DEVICES` must have:
 
 Optional **labels** – map of extra label names and values.
 
+Optional **scrape_interval** – per-device detached scrape interval override (e.g. `"2m"`).
+
 ### Example `.env`
 
 ```env
 ECHONET_LISTEN_ADDR=:9191
 ECHONET_SCRAPE_TIMEOUT_SEC=15
 ECHONET_DEVICES='[
-  {"name":"epcube_battery","ip":"192.168.1.10","class":"storage_battery"},
+  {"name":"epcube_battery","ip":"192.168.1.10","class":"storage_battery","scrape_interval":"2m","labels":{"site":"home"}},
   {"name":"epcube_solar","ip":"192.168.1.10","class":"home_solar"},
   {"name":"living_ac","ip":"192.168.1.20","class":"home_ac"}
 ]'
