@@ -1,6 +1,13 @@
 # ECHONET Lite Exporter
 
-A Prometheus exporter for ECHONET Lite devices: EP Cube (battery and solar), home air conditioners (e.g. Daikin, Mitsubishi), and compatible gear. It polls configured devices over UDP and exposes curated metrics for scraping by VictoriaMetrics or Prometheus.
+A Prometheus exporter for ECHONET Lite devices: EP Cube (battery and solar), home air conditioners (e.g. Daikin, Mitsubishi), and compatible gear. It polls configured devices over UDP and exposes metrics for scraping by VictoriaMetrics or Prometheus.
+
+## Features
+
+- **Detached Scraping**: Background goroutines poll devices at configurable intervals, while the `/metrics` endpoint serves cached values instantly. This prevents overloading low-power IoT devices (like ESP32-based hardware) during frequent Prometheus scrapes.
+- **Zero-Code Extensibility**: Device specifications (EOJ, EPCs, data types) are defined in YAML files. You can add support for new devices without writing Go code.
+- **Multi-Interval Batching**: Metrics with the same scrape interval are batched into a single UDP request to minimize network traffic.
+- **Dynamic Labels**: Attach custom labels to your devices in the configuration to organize them in Prometheus/VictoriaMetrics.
 
 ## Configuration
 
@@ -53,7 +60,9 @@ With a `.env` in the current directory, the exporter loads it automatically. The
 
 ## Metrics
 
-All metrics use the prefix `echonet_` and the labels `device`, `ip`, and `class`.
+All metrics use the prefix `echonet_` and the labels `device`, `ip`, `class`, plus any custom `labels` defined in your configuration.
+
+The specific metrics exposed depend on the YAML device specifications. The default built-in specifications provide:
 
 ### Scrape health
 
