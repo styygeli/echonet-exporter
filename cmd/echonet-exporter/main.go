@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,25 +12,29 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/sty/echonet-exporter/internal/config"
-	"github.com/sty/echonet-exporter/internal/metrics"
-	"github.com/sty/echonet-exporter/internal/scraper"
-	"github.com/sty/echonet-exporter/internal/specs"
+	"github.com/styygeli/echonet-exporter/internal/config"
+	"github.com/styygeli/echonet-exporter/internal/logging"
+	"github.com/styygeli/echonet-exporter/internal/metrics"
+	"github.com/styygeli/echonet-exporter/internal/scraper"
+	"github.com/styygeli/echonet-exporter/internal/specs"
 )
 
 func main() {
+	log := logging.New("main")
+	logging.SetLevelFromEnv()
+
 	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found, relying on existing environment variables.")
+		log.Infof("No .env file found, relying on existing environment variables.")
 	}
 
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("Config: %v", err)
+		log.Fatalf("config: %v", err)
 	}
 
 	deviceSpecs, err := specs.Load()
 	if err != nil {
-		log.Fatalf("Load device specs: %v", err)
+		log.Fatalf("load device specs: %v", err)
 	}
 
 	cache := scraper.NewCache()
@@ -55,12 +58,14 @@ func main() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
-		log.Println("Shutting down...")
+		log.Infof("Shutting down...")
 		cancel()
-		server.Shutdown(context.Background())
+		if err := server.Shutdown(context.Background()); err != nil {
+			log.Errorf("HTTP shutdown: %v", err)
+		}
 	}()
 
-	log.Printf("Listening on %s", cfg.ListenAddr)
+	log.Infof("Listening on %s", cfg.ListenAddr)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("HTTP server: %v", err)
 	}

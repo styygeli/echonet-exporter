@@ -8,6 +8,8 @@ A Prometheus exporter for ECHONET Lite devices: EP Cube (battery and solar), hom
 - **Zero-Code Extensibility**: Device specifications (EOJ, EPCs, data types) are defined in YAML files. You can add support for new devices without writing Go code.
 - **Multi-Interval Batching**: Metrics with the same scrape interval are batched into a single UDP request to minimize network traffic.
 - **Dynamic Labels**: Attach custom labels to your devices in the configuration to organize them in Prometheus/VictoriaMetrics.
+- **Capability-Aware Polling**: On startup, the exporter reads each device `GETMAP` (`EPC 0x9F`) and automatically skips configured EPCs the device does not report as readable.
+- **Adaptive OPC Fallback**: If a device returns partial responses for larger EPC batches, the exporter automatically retries with smaller split batches.
 
 ## Configuration
 
@@ -17,6 +19,7 @@ Configuration is via environment variables (and optionally a `.env` file).
 |----------|-------------|---------|
 | `ECHONET_LISTEN_ADDR` | HTTP listen address | `:9191` |
 | `ECHONET_SCRAPE_TIMEOUT_SEC` | Timeout in seconds for each device scrape | `15` |
+| `ECHONET_LOG_LEVEL` | Log verbosity (`debug`, `info`, `warn`, `error`) | `info` |
 | `ECHONET_DEVICES` | JSON array of device definitions | (none) |
 
 Each device in `ECHONET_DEVICES` must have:
@@ -46,6 +49,20 @@ ECHONET_DEVICES='[
 
 See [.env.example](.env.example) for a copy-paste template.
 
+### Logging
+
+The exporter uses a centralized logging layer:
+
+- `debug` and `info` logs go to **stdout**
+- `warn` and `error` logs go to **stderr**
+
+Use `ECHONET_LOG_LEVEL` to control verbosity:
+
+- `debug` - detailed protocol diagnostics (TID mismatches, ignored frames)
+- `info` - startup and lifecycle messages
+- `warn` - malformed/partial client responses and degraded behavior
+- `error` - scrape failures and hard problems
+
 ## Building and running
 
 ```bash
@@ -69,6 +86,7 @@ The specific metrics exposed depend on the YAML device specifications. The defau
 - `echonet_scrape_success` – 1 if the last scrape succeeded, 0 otherwise.
 - `echonet_scrape_duration_seconds` – duration of the last scrape.
 - `echonet_last_scrape_timestamp_seconds` – Unix time of the last successful scrape.
+- `echonet_device_info` – identity labels from generic properties (`manufacturer`, `product_code`, `uid`) with constant value `1`.
 
 ### Battery (`storage_battery`)
 
@@ -89,7 +107,20 @@ The specific metrics exposed depend on the YAML device specifications. The defau
 - `echonet_ac_operation_status` – 0x30=ON, 0x31=OFF.
 - `echonet_ac_indoor_temperature_celsius` – room temperature (°C).
 - `echonet_ac_set_temperature_celsius` – target temperature (°C).
-- `echonet_ac_operation_mode` – mode (numeric ECHONET value).
+- `echonet_ac_operation_mode` – raw operation mode code from EPC `0xB0`.
+
+Common `echonet_ac_operation_mode` codes for home AC:
+- `0x41` = auto
+- `0x42` = cool
+- `0x43` = heat
+- `0x44` = dry
+- `0x45` = fan_only
+- `0x40` = other
+
+Vendors may expose additional mode codes, so this metric intentionally exports the raw value.
+When `enum` mappings are defined in YAML, companion one-hot metrics are exported. For example:
+- `echonet_ac_operation_mode_is_auto`
+- `echonet_ac_operation_mode_is_cool`
 
 ## VictoriaMetrics scrape config
 
@@ -122,6 +153,7 @@ The exporter uses *detached scraping*: background goroutines poll devices at con
 - **scrape_interval** (per-device, in `ECHONET_DEVICES`): Runtime override for a specific device instance, e.g. `{"name":"epcube","ip":"192.168.1.10","class":"storage_battery","scrape_interval":"2m"}`.
 
 Metrics with the same interval are batched into one ECHONET Get request per tick.
+When supported by the device, only readable EPCs from `GETMAP` are polled.
 
 **Example** (`internal/specs/devices/heat_pump.yaml`):
 
@@ -149,7 +181,7 @@ metrics:
 **Fields:**
 - `eoj` – ECHONET Object (3 bytes: group, class, instance).
 - `default_scrape_interval` – optional, e.g. `1m`, `30s`. Default for metrics without `scrape_interval`.
-- `metrics` – list of EPCs to poll. Each: `epc` (hex), `name`, `help`, `size` (1/2/4 bytes), `scale` (multiplier), `type` (gauge/counter), optional `signed`, optional `invalid` (raw value meaning invalid), optional `scrape_interval` (e.g. `5m` for less frequent polling).
+- `metrics` – list of EPCs to poll. Each: `epc` (hex), `name`, `help`, `size` (1/2/4 bytes), `scale` (multiplier), `type` (gauge/counter), optional `signed`, optional `invalid` (raw value meaning invalid), optional `enum` map (`raw_value: label`) for one-hot enum metrics, optional `scrape_interval` (e.g. `5m` for less frequent polling).
 
 **Custom devices dir:** Set `ECHONET_DEVICES_DIR` to load additional YAML files from a directory (e.g. for local-only device specs without modifying the repo).
 

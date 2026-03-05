@@ -1,6 +1,7 @@
 package specs
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -26,6 +27,13 @@ metrics:
     signed: true
     type: counter
     scrape_interval: 10m
+  - epc: 0xB0
+    name: operation_mode
+    size: 1
+    type: gauge
+    enum:
+      0x41: auto
+      0x42: cool
 `)
 
 	spec, err := parseDeviceYAML(yamlData)
@@ -41,8 +49,8 @@ metrics:
 		t.Errorf("wrong default interval: %v", spec.DefaultScrapeInterval)
 	}
 
-	if len(spec.Metrics) != 2 {
-		t.Fatalf("expected 2 metrics, got %d", len(spec.Metrics))
+	if len(spec.Metrics) != 3 {
+		t.Fatalf("expected 3 metrics, got %d", len(spec.Metrics))
 	}
 
 	m1 := spec.Metrics[0]
@@ -59,6 +67,14 @@ metrics:
 	}
 	if m2.ScrapeInterval != 10*time.Minute {
 		t.Errorf("m2 should have 10m interval, got %v", m2.ScrapeInterval)
+	}
+
+	m3 := spec.Metrics[2]
+	if m3.EPC != 0xB0 || m3.Help != "Operation mode setting" {
+		t.Errorf("wrong m3 help fallback: %+v", m3)
+	}
+	if len(m3.Enum) != 2 || m3.Enum[0x41] != "auto" || m3.Enum[0x42] != "cool" {
+		t.Errorf("wrong m3 enum mapping: %+v", m3.Enum)
 	}
 }
 
@@ -114,6 +130,35 @@ metrics:
 `,
 			want: "type must be gauge or counter",
 		},
+		{
+			name: "enum requires scale 1",
+			yaml: `
+eoj: [0x01, 0x30, 0x01]
+metrics:
+  - epc: 0xB0
+    name: mode
+    size: 1
+    scale: 0.1
+    type: gauge
+    enum:
+      0x41: auto
+`,
+			want: "enum mapping requires scale=1",
+		},
+		{
+			name: "enum value out of range",
+			yaml: `
+eoj: [0x01, 0x30, 0x01]
+metrics:
+  - epc: 0xB0
+    name: mode
+    size: 1
+    type: gauge
+    enum:
+      300: invalid
+`,
+			want: "enum value 300 doesn't fit",
+		},
 	}
 
 	for _, tt := range tests {
@@ -121,6 +166,9 @@ metrics:
 			_, err := parseDeviceYAML([]byte(tt.yaml))
 			if err == nil {
 				t.Fatalf("expected error containing %q, got nil", tt.want)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected error containing %q, got %q", tt.want, err.Error())
 			}
 		})
 	}

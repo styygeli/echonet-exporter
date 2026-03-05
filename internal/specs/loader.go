@@ -90,15 +90,16 @@ type deviceYAML struct {
 }
 
 type metricYAML struct {
-	EPC            int     `yaml:"epc"`
-	Name           string  `yaml:"name"`
-	Help           string  `yaml:"help"`
-	Size           int     `yaml:"size"`
-	Scale          float64 `yaml:"scale"`
-	Signed         bool    `yaml:"signed"`
-	Invalid        *int    `yaml:"invalid"`
-	Type           string  `yaml:"type"`
-	ScrapeInterval string  `yaml:"scrape_interval"`
+	EPC            int            `yaml:"epc"`
+	Name           string         `yaml:"name"`
+	Help           string         `yaml:"help"`
+	Size           int            `yaml:"size"`
+	Scale          float64        `yaml:"scale"`
+	Signed         bool           `yaml:"signed"`
+	Invalid        *int           `yaml:"invalid"`
+	Type           string         `yaml:"type"`
+	Enum           map[int]string `yaml:"enum"`
+	ScrapeInterval string         `yaml:"scrape_interval"`
 }
 
 func parseDeviceYAML(data []byte) (*DeviceSpec, error) {
@@ -143,6 +144,33 @@ func parseDeviceYAML(data []byte) (*DeviceSpec, error) {
 		if m.EPC < 0 || m.EPC > 0xFF {
 			return nil, fmt.Errorf("metric %s: epc must be in range 0..255, got %d", m.Name, m.EPC)
 		}
+		scale := m.Scale
+		if scale == 0 {
+			scale = 1
+		}
+
+		var enum map[int]string
+		if len(m.Enum) > 0 {
+			if scale != 1 {
+				return nil, fmt.Errorf("metric %s: enum mapping requires scale=1, got %v", m.Name, scale)
+			}
+			enum = make(map[int]string, len(m.Enum))
+			for rawValue, label := range m.Enum {
+				if label == "" {
+					return nil, fmt.Errorf("metric %s: enum label must not be empty for value %d", m.Name, rawValue)
+				}
+				if !enumValueFits(rawValue, m.Size, m.Signed) {
+					return nil, fmt.Errorf("metric %s: enum value %d doesn't fit size=%d signed=%t", m.Name, rawValue, m.Size, m.Signed)
+				}
+				enum[rawValue] = label
+			}
+		}
+
+		help := m.Help
+		if help == "" {
+			help = lookupEPCName(spec.EOJ, byte(m.EPC))
+		}
+
 		interval := devInterval
 		if m.ScrapeInterval != "" {
 			d, err := time.ParseDuration(m.ScrapeInterval)
@@ -157,18 +185,27 @@ func parseDeviceYAML(data []byte) (*DeviceSpec, error) {
 		ms := MetricSpec{
 			EPC:            byte(m.EPC),
 			Name:           m.Name,
-			Help:           m.Help,
+			Help:           help,
 			Size:           m.Size,
-			Scale:          m.Scale,
+			Scale:          scale,
 			Signed:         m.Signed,
 			Invalid:        m.Invalid,
 			Type:           m.Type,
+			Enum:           enum,
 			ScrapeInterval: interval,
-		}
-		if ms.Scale == 0 {
-			ms.Scale = 1
 		}
 		spec.Metrics = append(spec.Metrics, ms)
 	}
 	return spec, nil
+}
+
+func enumValueFits(v int, size int, signed bool) bool {
+	bits := size * 8
+	if signed {
+		min := -(1 << (bits - 1))
+		max := (1 << (bits - 1)) - 1
+		return v >= min && v <= max
+	}
+	max := (1 << bits) - 1
+	return v >= 0 && v <= max
 }

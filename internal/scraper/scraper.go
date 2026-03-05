@@ -2,14 +2,14 @@ package scraper
 
 import (
 	"context"
-	"log"
 	"sort"
 	"sync"
 	"time"
 
-	"github.com/sty/echonet-exporter/internal/config"
-	"github.com/sty/echonet-exporter/internal/echonet"
-	"github.com/sty/echonet-exporter/internal/specs"
+	"github.com/styygeli/echonet-exporter/internal/config"
+	"github.com/styygeli/echonet-exporter/internal/echonet"
+	"github.com/styygeli/echonet-exporter/internal/logging"
+	"github.com/styygeli/echonet-exporter/internal/specs"
 )
 
 // Cache holds the latest scraped metrics per device. Safe for concurrent use.
@@ -21,6 +21,7 @@ type Cache struct {
 type deviceCache struct {
 	groups  map[string]groupStatus
 	metrics map[string]echonet.MetricValue
+	info    echonet.DeviceInfo
 }
 
 type groupStatus struct {
@@ -30,6 +31,8 @@ type groupStatus struct {
 	lastAttempt time.Time
 	lastSuccess time.Time
 }
+
+var scraperLog = logging.New("scraper")
 
 // deviceKey returns a unique key for a configured device.
 func deviceKey(dev config.Device) string {
@@ -84,6 +87,18 @@ func (c *Cache) Get(dev config.Device) (success bool, durationSec float64, lastS
 	return aggregatedSuccess, latestDuration, latestSuccess, mcopy
 }
 
+// GetInfo returns the latest cached generic device identity.
+func (c *Cache) GetInfo(dev config.Device) echonet.DeviceInfo {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	dc, ok := c.metrics[deviceKey(dev)]
+	if !ok {
+		return echonet.DeviceInfo{}
+	}
+	return dc.info
+}
+
 // Update merges a scrape result into the cache for a device/group.
 func (c *Cache) Update(dev config.Device, groupID string, interval time.Duration, success bool, durationSec float64, metrics map[string]echonet.MetricValue) {
 	c.mu.Lock()
@@ -115,6 +130,17 @@ func (c *Cache) Update(dev config.Device, groupID string, interval time.Duration
 	c.metrics[key] = dc
 }
 
+// UpdateInfo stores generic device identity properties.
+func (c *Cache) UpdateInfo(dev config.Device, info echonet.DeviceInfo) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	key := deviceKey(dev)
+	dc := c.metrics[key]
+	dc.info = info
+	c.metrics[key] = dc
+}
+
 // Start begins background scrapers for all configured devices. Call with a context
 // that is cancelled on shutdown.
 func (c *Cache) Start(ctx context.Context, cfg *config.Config, deviceSpecs map[string]*specs.DeviceSpec) {
@@ -123,7 +149,26 @@ func (c *Cache) Start(ctx context.Context, cfg *config.Config, deviceSpecs map[s
 	for _, dev := range cfg.Devices {
 		spec, ok := deviceSpecs[dev.Class]
 		if !ok || spec == nil {
-			log.Printf("scraper: unknown class %q for device %s, skipping", dev.Class, dev.Name)
+			scraperLog.Errorf("unknown class %q for device %s, skipping", dev.Class, dev.Name)
+			continue
+		}
+
+		// Refresh static identity metadata in the background.
+		go c.runDeviceInfoRefresher(ctx, client, dev, spec.EOJ)
+
+		activeMetrics := spec.Metrics
+		readable, err := client.GetReadablePropertyMap(dev.IP, spec.EOJ)
+		if err != nil {
+			scraperLog.Warnf("device %s (%s): failed to read GETMAP (0x9F), using configured EPCs: %v", dev.Name, dev.IP, err)
+		} else {
+			var unsupported []byte
+			activeMetrics, unsupported = filterMetricsByReadableMap(spec.Metrics, readable)
+			if len(unsupported) > 0 {
+				scraperLog.Warnf("device %s (%s): skipping unsupported EPCs from GETMAP: %v", dev.Name, dev.IP, unsupported)
+			}
+		}
+		if len(activeMetrics) == 0 {
+			scraperLog.Errorf("device %s (%s): no readable configured EPCs after GETMAP filter, skipping", dev.Name, dev.IP)
 			continue
 		}
 
@@ -132,7 +177,7 @@ func (c *Cache) Start(ctx context.Context, cfg *config.Config, deviceSpecs map[s
 		if dev.ScrapeInterval != "" {
 			d, err := time.ParseDuration(dev.ScrapeInterval)
 			if err != nil {
-				log.Printf("scraper: device %s invalid scrape_interval %q: %v", dev.Name, dev.ScrapeInterval, err)
+				scraperLog.Warnf("device %s invalid scrape_interval %q: %v", dev.Name, dev.ScrapeInterval, err)
 			} else if d > 0 {
 				devDefaultInterval = d
 			}
@@ -140,7 +185,7 @@ func (c *Cache) Start(ctx context.Context, cfg *config.Config, deviceSpecs map[s
 
 		// Group metrics by their scrape interval
 		byInterval := make(map[time.Duration][]specs.MetricSpec)
-		for _, m := range spec.Metrics {
+		for _, m := range activeMetrics {
 			iv := m.ScrapeInterval
 			if iv <= 0 {
 				iv = devDefaultInterval
@@ -167,6 +212,44 @@ func (c *Cache) Start(ctx context.Context, cfg *config.Config, deviceSpecs map[s
 			go c.runScraper(ctx, client, dev, spec, metrics, groupID, interval, initialDelay)
 		}
 	}
+}
+
+func filterMetricsByReadableMap(metrics []specs.MetricSpec, readable map[byte]struct{}) ([]specs.MetricSpec, []byte) {
+	filtered := make([]specs.MetricSpec, 0, len(metrics))
+	unsupported := make([]byte, 0)
+	for _, m := range metrics {
+		if _, ok := readable[m.EPC]; ok {
+			filtered = append(filtered, m)
+			continue
+		}
+		unsupported = append(unsupported, m.EPC)
+	}
+	return filtered, unsupported
+}
+
+func (c *Cache) runDeviceInfoRefresher(ctx context.Context, client *echonet.Client, dev config.Device, eoj [3]byte) {
+	c.refreshDeviceInfo(client, dev, eoj)
+
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.refreshDeviceInfo(client, dev, eoj)
+		}
+	}
+}
+
+func (c *Cache) refreshDeviceInfo(client *echonet.Client, dev config.Device, eoj [3]byte) {
+	info, err := client.GetDeviceInfo(dev.IP, eoj)
+	if err != nil {
+		scraperLog.Warnf("device %s (%s): device info read failed: %v", dev.Name, dev.IP, err)
+		return
+	}
+	c.UpdateInfo(dev, info)
 }
 
 func (c *Cache) runScraper(ctx context.Context, client *echonet.Client, dev config.Device, spec *specs.DeviceSpec, metrics []specs.MetricSpec, groupID string, interval, initialDelay time.Duration) {
@@ -200,21 +283,30 @@ func (c *Cache) scrapeOnce(client *echonet.Client, dev config.Device, spec *spec
 	}
 
 	start := time.Now()
-	raw, err := client.SendGet(dev.IP, spec.EOJ, epcs)
+	props, err := client.GetProps(dev.IP, spec.EOJ, epcs)
 	durationSec := time.Since(start).Seconds()
 	if err != nil {
-		log.Printf("scrape %s (%s): %v", dev.Name, dev.IP, err)
-		c.Update(dev, groupID, interval, false, durationSec, nil)
-		return
-	}
-
-	_, props, err := echonet.ParseGetRes(raw)
-	if err != nil {
-		log.Printf("scrape %s (%s): parse: %v", dev.Name, dev.IP, err)
+		scraperLog.Errorf("scrape %s (%s): %v", dev.Name, dev.IP, err)
 		c.Update(dev, groupID, interval, false, durationSec, nil)
 		return
 	}
 
 	out := echonet.ParsePropsToMetrics(props, metrics)
+	if len(out) < len(metrics) {
+		scraperLog.Warnf(
+			"device %s (%s): parsed %d/%d metrics for group %s; missing=%v",
+			dev.Name, dev.IP, len(out), len(metrics), groupID, missingMetricNames(metrics, out),
+		)
+	}
 	c.Update(dev, groupID, interval, true, durationSec, out)
+}
+
+func missingMetricNames(metrics []specs.MetricSpec, out map[string]echonet.MetricValue) []string {
+	missing := make([]string, 0)
+	for _, m := range metrics {
+		if _, ok := out[m.Name]; !ok {
+			missing = append(missing, m.Name)
+		}
+	}
+	return missing
 }

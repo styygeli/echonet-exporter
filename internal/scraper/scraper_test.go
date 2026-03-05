@@ -4,8 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sty/echonet-exporter/internal/config"
-	"github.com/sty/echonet-exporter/internal/echonet"
+	"github.com/styygeli/echonet-exporter/internal/config"
+	"github.com/styygeli/echonet-exporter/internal/echonet"
+	"github.com/styygeli/echonet-exporter/internal/specs"
 )
 
 func TestCacheAggregation(t *testing.T) {
@@ -89,5 +90,45 @@ func TestCacheFreshness(t *testing.T) {
 	success, _, _, _ = c.Get(dev)
 	if success {
 		t.Error("expected success=false after TTL expired")
+	}
+}
+
+func TestCacheDeviceInfo(t *testing.T) {
+	c := NewCache()
+	dev := config.Device{Name: "test", IP: "127.0.0.1", Class: "test_class"}
+
+	info := echonet.DeviceInfo{
+		UID:          "aabbccdd",
+		Manufacturer: "Sungrow",
+		ProductCode:  "GZ-000900",
+	}
+	c.UpdateInfo(dev, info)
+
+	got := c.GetInfo(dev)
+	if got.UID != info.UID || got.Manufacturer != info.Manufacturer || got.ProductCode != info.ProductCode {
+		t.Fatalf("unexpected device info: got %+v want %+v", got, info)
+	}
+}
+
+func TestFilterMetricsByReadableMap(t *testing.T) {
+	metrics := []specs.MetricSpec{
+		{Name: "status", EPC: 0x80},
+		{Name: "mode", EPC: 0xB0},
+		{Name: "temp", EPC: 0xBB},
+	}
+	readable := map[byte]struct{}{
+		0x80: {},
+		0xBB: {},
+	}
+
+	filtered, unsupported := filterMetricsByReadableMap(metrics, readable)
+	if len(filtered) != 2 {
+		t.Fatalf("expected 2 filtered metrics, got %d", len(filtered))
+	}
+	if filtered[0].EPC != 0x80 || filtered[1].EPC != 0xBB {
+		t.Fatalf("unexpected filtered metrics: %+v", filtered)
+	}
+	if len(unsupported) != 1 || unsupported[0] != 0xB0 {
+		t.Fatalf("unexpected unsupported EPCs: %+v", unsupported)
 	}
 }

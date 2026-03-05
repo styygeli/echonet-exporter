@@ -2,12 +2,17 @@ package echonet
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"net"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 
-	"github.com/sty/echonet-exporter/internal/model"
-	"github.com/sty/echonet-exporter/internal/specs"
+	"github.com/styygeli/echonet-exporter/internal/logging"
+	"github.com/styygeli/echonet-exporter/internal/model"
+	"github.com/styygeli/echonet-exporter/internal/specs"
 )
 
 const (
@@ -22,15 +27,27 @@ const (
 	minResponseLen = 12
 )
 
+var clientLog = logging.New("echonet-client")
+
 // Client sends ECHONET Lite Get requests over UDP and parses Get_Res.
 type Client struct {
-	timeout time.Duration
+	timeout   time.Duration
+	lockMu    sync.Mutex
+	hostLocks map[string]*sync.Mutex
+}
+
+// DeviceInfo represents generic identity properties of a device.
+type DeviceInfo struct {
+	UID          string
+	Manufacturer string
+	ProductCode  string
 }
 
 // NewClient creates a client with the given scrape timeout.
 func NewClient(timeoutSec int) *Client {
 	return &Client{
-		timeout: time.Duration(timeoutSec) * time.Second,
+		timeout:   time.Duration(timeoutSec) * time.Second,
+		hostLocks: make(map[string]*sync.Mutex),
 	}
 }
 
@@ -55,6 +72,11 @@ func (c *Client) SendGet(addr string, eoj [3]byte, epcs []byte) ([]byte, error) 
 	if len(epcs) == 0 {
 		return nil, fmt.Errorf("no EPCs")
 	}
+	hostKey := normalizeHost(addr)
+	hostLock := c.lockForHost(hostKey)
+	hostLock.Lock()
+	defer hostLock.Unlock()
+
 	tid := uint16(time.Now().UnixNano() & 0xFFFF)
 	req := GetRequest(tid, eoj, epcs)
 
@@ -83,11 +105,35 @@ func (c *Client) SendGet(addr string, eoj [3]byte, epcs []byte) ([]byte, error) 
 		if err != nil {
 			return nil, err
 		}
-		if n >= minResponseLen && binary.BigEndian.Uint16(buf[2:4]) == tid {
+		if n < minResponseLen {
+			clientLog.Warnf("short UDP frame from %s: got=%d expected>=%d", hostKey, n, minResponseLen)
+			continue
+		}
+		respTID := binary.BigEndian.Uint16(buf[2:4])
+		if respTID == tid {
 			return buf[:n], nil
 		}
-		// Ignore packets with wrong TID or too short
+		clientLog.Debugf("ignoring stale UDP frame from %s: expected tid=0x%04x got=0x%04x", hostKey, tid, respTID)
 	}
+}
+
+func normalizeHost(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err == nil {
+		return host
+	}
+	return addr
+}
+
+func (c *Client) lockForHost(host string) *sync.Mutex {
+	c.lockMu.Lock()
+	defer c.lockMu.Unlock()
+	if m, ok := c.hostLocks[host]; ok {
+		return m
+	}
+	m := &sync.Mutex{}
+	c.hostLocks[host] = m
+	return m
 }
 
 // ParseGetRes parses an ECHONET Lite frame and returns properties if it is a Get_Res.
@@ -105,12 +151,15 @@ func ParseGetRes(data []byte) (tid uint16, props []model.GetResProperty, err err
 	}
 	opc := int(data[11])
 	pos := 12
+	truncated := false
 	for i := 0; i < opc && pos+2 <= len(data); i++ {
 		epc := data[pos]
 		pdc := data[pos+1]
 		pos += 2
 		edtLen := int(pdc)
 		if pos+edtLen > len(data) {
+			clientLog.Warnf("malformed Get_Res: truncated property data for EPC=0x%02x PDC=%d payload_len=%d", epc, pdc, len(data))
+			truncated = true
 			break
 		}
 		edt := make([]byte, edtLen)
@@ -118,13 +167,291 @@ func ParseGetRes(data []byte) (tid uint16, props []model.GetResProperty, err err
 		pos += edtLen
 		props = append(props, model.GetResProperty{EPC: epc, PDC: pdc, EDT: edt})
 	}
+	if len(props) < opc {
+		if truncated {
+			clientLog.Warnf("Get_Res partially parsed: parsed=%d declared_opc=%d", len(props), opc)
+		} else {
+			clientLog.Warnf("Get_Res ended early: parsed=%d declared_opc=%d", len(props), opc)
+		}
+	}
 	return tid, props, nil
+}
+
+const maxAdaptiveSplitDepth = 8
+
+// GetProps fetches requested EPCs and adaptively splits large OPC batches when
+// devices return partial responses.
+func (c *Client) GetProps(addr string, eoj [3]byte, epcs []byte) ([]model.GetResProperty, error) {
+	return c.getPropsAdaptive(addr, eoj, epcs, 0)
+}
+
+func (c *Client) getPropsAdaptive(addr string, eoj [3]byte, epcs []byte, depth int) ([]model.GetResProperty, error) {
+	raw, err := c.SendGet(addr, eoj, epcs)
+	if err != nil {
+		return nil, err
+	}
+
+	_, props, err := ParseGetRes(raw)
+	if err != nil {
+		return nil, err
+	}
+
+	missing := missingEPCs(epcs, props)
+	if len(missing) == 0 {
+		return props, nil
+	}
+
+	if len(epcs) <= 1 {
+		clientLog.Warnf(
+			"device %s returned no data for requested EPC(s): %s",
+			normalizeHost(addr), formatEPCList(missing),
+		)
+		return props, nil
+	}
+	if depth >= maxAdaptiveSplitDepth {
+		clientLog.Warnf(
+			"max adaptive split depth reached for %s eoj=%s missing=%s",
+			normalizeHost(addr), formatEOJ(eoj), formatEPCList(missing),
+		)
+		return props, nil
+	}
+
+	clientLog.Warnf(
+		"partial response from %s eoj=%s requested=%d returned=%d missing=%s; retrying split batches",
+		normalizeHost(addr), formatEOJ(eoj), len(epcs), len(props), formatEPCList(missing),
+	)
+
+	left, right := splitEPCs(epcs)
+	merged := propsToMap(props)
+
+	for _, part := range [][]byte{left, right} {
+		if len(part) == 0 || !containsAny(part, missing) {
+			continue
+		}
+		partProps, err := c.getPropsAdaptive(addr, eoj, part, depth+1)
+		if err != nil {
+			clientLog.Warnf(
+				"split batch request failed for %s eoj=%s epcs=%s: %v",
+				normalizeHost(addr), formatEOJ(eoj), formatEPCList(part), err,
+			)
+			continue
+		}
+		mergeProps(merged, partProps)
+	}
+
+	out := mapToProps(merged)
+	finalMissing := missingEPCs(epcs, out)
+	if len(finalMissing) > 0 {
+		clientLog.Warnf(
+			"after retries, still missing EPC(s) from %s eoj=%s: %s",
+			normalizeHost(addr), formatEOJ(eoj), formatEPCList(finalMissing),
+		)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no properties returned for requested EPCs")
+	}
+	return out, nil
+}
+
+// GetReadablePropertyMap reads EPC 0x9F and decodes readable properties.
+func (c *Client) GetReadablePropertyMap(addr string, eoj [3]byte) (map[byte]struct{}, error) {
+	props, err := c.GetProps(addr, eoj, []byte{0x9F})
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range props {
+		if p.EPC == 0x9F && len(p.EDT) > 0 {
+			return decodePropertyMap(p.EDT), nil
+		}
+	}
+	clientLog.Warnf("device %s eoj=%s: readable property map (0x9F) missing/empty", normalizeHost(addr), formatEOJ(eoj))
+	return nil, fmt.Errorf("readable property map (0x9F) missing")
+}
+
+// GetDeviceInfo reads generic identity properties.
+func (c *Client) GetDeviceInfo(addr string, eoj [3]byte) (DeviceInfo, error) {
+	props, err := c.GetProps(addr, eoj, []byte{0x83, 0x8A, 0x8C})
+	if err != nil {
+		return DeviceInfo{}, err
+	}
+	info := DeviceInfo{}
+	for _, p := range props {
+		switch p.EPC {
+		case 0x83:
+			info.UID = decodeUID(p.EDT, normalizeHost(addr))
+		case 0x8A:
+			info.Manufacturer = decodeManufacturer(p.EDT)
+		case 0x8C:
+			info.ProductCode = decodeProductCode(p.EDT)
+		}
+	}
+	if info.UID == "" || info.Manufacturer == "" || info.ProductCode == "" {
+		clientLog.Warnf(
+			"device %s eoj=%s: incomplete device info uid=%q manufacturer=%q product_code=%q",
+			normalizeHost(addr), formatEOJ(eoj), info.UID, info.Manufacturer, info.ProductCode,
+		)
+	}
+	return info, nil
 }
 
 // MetricValue holds a parsed value and its type (gauge or counter).
 type MetricValue struct {
 	Value float64
 	Type  string // "gauge" or "counter"
+}
+
+var manufacturerNames = map[uint32]string{
+	0x000006: "Mitsubishi Electric",
+	0x000008: "Daikin Industries",
+	0x00000B: "Panasonic",
+	0x00008A: "Fujitsu General",
+	0x0000CC: "Hitachi-Johnson Controls Air Conditioning",
+	0x000116: "Sungrow Power Supply",
+	0x000131: "Sungrow",
+}
+
+func missingEPCs(requested []byte, props []model.GetResProperty) []byte {
+	seen := make(map[byte]struct{}, len(props))
+	for _, p := range props {
+		seen[p.EPC] = struct{}{}
+	}
+	missing := make([]byte, 0, len(requested))
+	for _, epc := range requested {
+		if _, ok := seen[epc]; !ok {
+			missing = append(missing, epc)
+		}
+	}
+	return missing
+}
+
+func splitEPCs(epcs []byte) ([]byte, []byte) {
+	if len(epcs) <= 1 {
+		return epcs, nil
+	}
+	mid := len(epcs) / 2
+	if mid == 0 {
+		mid = 1
+	}
+	left := append([]byte(nil), epcs[:mid]...)
+	right := append([]byte(nil), epcs[mid:]...)
+	return left, right
+}
+
+func formatEOJ(eoj [3]byte) string {
+	return fmt.Sprintf("0x%02x%02x%02x", eoj[0], eoj[1], eoj[2])
+}
+
+func formatEPCList(epcs []byte) string {
+	if len(epcs) == 0 {
+		return "[]"
+	}
+	parts := make([]string, 0, len(epcs))
+	for _, epc := range epcs {
+		parts = append(parts, fmt.Sprintf("0x%02x", epc))
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
+}
+
+func containsAny(candidates []byte, set []byte) bool {
+	lookup := make(map[byte]struct{}, len(set))
+	for _, v := range set {
+		lookup[v] = struct{}{}
+	}
+	for _, v := range candidates {
+		if _, ok := lookup[v]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func propsToMap(props []model.GetResProperty) map[byte]model.GetResProperty {
+	out := make(map[byte]model.GetResProperty, len(props))
+	for _, p := range props {
+		existing, ok := out[p.EPC]
+		if !ok || (len(existing.EDT) == 0 && len(p.EDT) > 0) {
+			out[p.EPC] = p
+		}
+	}
+	return out
+}
+
+func mergeProps(dst map[byte]model.GetResProperty, src []model.GetResProperty) {
+	for _, p := range src {
+		existing, ok := dst[p.EPC]
+		if !ok || (len(existing.EDT) == 0 && len(p.EDT) > 0) {
+			dst[p.EPC] = p
+		}
+	}
+}
+
+func mapToProps(props map[byte]model.GetResProperty) []model.GetResProperty {
+	keys := make([]int, 0, len(props))
+	for epc := range props {
+		keys = append(keys, int(epc))
+	}
+	sort.Ints(keys)
+	out := make([]model.GetResProperty, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, props[byte(k)])
+	}
+	return out
+}
+
+func decodePropertyMap(edt []byte) map[byte]struct{} {
+	out := make(map[byte]struct{})
+	if len(edt) == 0 {
+		return out
+	}
+	// Property map format 1: [count, epc1, epc2, ...]
+	if len(edt) < 17 {
+		for i := 1; i < len(edt); i++ {
+			out[edt[i]] = struct{}{}
+		}
+		return out
+	}
+	// Property map format 2: bitmap map
+	for i := 1; i < len(edt); i++ {
+		code := byte(i - 1)
+		bits := edt[i]
+		for bit := 0; bit < 8; bit++ {
+			if ((bits >> bit) & 0x01) == 0x01 {
+				epc := byte((bit+8)*0x10) + code
+				out[epc] = struct{}{}
+			}
+		}
+	}
+	return out
+}
+
+func decodeUID(edt []byte, host string) string {
+	if len(edt) > 1 {
+		return hex.EncodeToString(edt[1:])
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			return fmt.Sprintf("%03d%03d", int(v4[2]), int(v4[3]))
+		}
+	}
+	return ""
+}
+
+func decodeManufacturer(edt []byte) string {
+	if len(edt) != 3 {
+		return ""
+	}
+	code := uint32(edt[0])<<16 | uint32(edt[1])<<8 | uint32(edt[2])
+	if name, ok := manufacturerNames[code]; ok {
+		return name
+	}
+	return fmt.Sprintf("0x%06X", code)
+}
+
+func decodeProductCode(edt []byte) string {
+	if len(edt) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(strings.TrimRight(string(edt), "\x00"))
 }
 
 func prop(props []model.GetResProperty, epc byte) ([]byte, bool) {
@@ -137,8 +464,13 @@ func prop(props []model.GetResProperty, epc byte) ([]byte, bool) {
 }
 
 func parseEDT(edt []byte, m specs.MetricSpec) (float64, bool) {
+	v, ok, _ := parseEDTWithReason(edt, m)
+	return v, ok
+}
+
+func parseEDTWithReason(edt []byte, m specs.MetricSpec) (float64, bool, string) {
 	if len(edt) < m.Size {
-		return 0, false
+		return 0, false, fmt.Sprintf("EDT too short: got=%d need=%d", len(edt), m.Size)
 	}
 	var raw int64
 	switch m.Size {
@@ -147,7 +479,7 @@ func parseEDT(edt []byte, m specs.MetricSpec) (float64, bool) {
 	case 2:
 		u := binary.BigEndian.Uint16(edt)
 		if m.Invalid != nil && int(u) == *m.Invalid {
-			return 0, false
+			return 0, false, fmt.Sprintf("raw value 0x%04x equals invalid sentinel", u)
 		}
 		if m.Signed {
 			raw = int64(int16(u))
@@ -162,9 +494,9 @@ func parseEDT(edt []byte, m specs.MetricSpec) (float64, bool) {
 			raw = int64(u)
 		}
 	default:
-		return 0, false
+		return 0, false, fmt.Sprintf("unsupported metric size: %d", m.Size)
 	}
-	return float64(raw) * m.Scale, true
+	return float64(raw) * m.Scale, true, ""
 }
 
 // ParsePropsToMetrics converts Get_Res properties into metrics using the given metric specs.
@@ -173,10 +505,16 @@ func ParsePropsToMetrics(props []model.GetResProperty, metrics []specs.MetricSpe
 	for _, m := range metrics {
 		edt, ok := prop(props, m.EPC)
 		if !ok {
+			clientLog.Warnf("missing EPC 0x%02x for metric %q in response", m.EPC, m.Name)
 			continue
 		}
-		v, ok := parseEDT(edt, m)
+		v, ok, reason := parseEDTWithReason(edt, m)
 		if !ok {
+			if strings.Contains(reason, "invalid sentinel") {
+				clientLog.Debugf("skipping metric %q (EPC 0x%02x): %s", m.Name, m.EPC, reason)
+			} else {
+				clientLog.Warnf("bad EPC payload for metric %q (EPC 0x%02x): %s", m.Name, m.EPC, reason)
+			}
 			continue
 		}
 		out[m.Name] = MetricValue{Value: v, Type: m.Type}

@@ -56,3 +56,13 @@ metrics:
     size: 1
     scale: 1
     type: gauge
+    enum:
+      0x40: other
+      0x41: rapid_charging
+      0x42: charging
+      0x43: discharging
+      0x44: standby
+      0x45: test
+      0x46: auto
+      0x48: restart
+      0x49: capacity_recalculation
